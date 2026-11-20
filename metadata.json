@@ -1,0 +1,6 @@
+{
+  "name": "Royo Farm",
+  "description": "Poultry farm management app for Royo Farm to track flocks, production, sales, expenses, and inventory with smart forecasting.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

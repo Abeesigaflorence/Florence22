@@ -1,0 +1,108 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function isCreator() {
+      return isSignedIn() && resource.data.createdBy == request.auth.uid;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.role == 'admin' ||
+        (request.auth.token.email != null && request.auth.token.email == 'florenceabeesiga@gmail.com') ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'ADMIN')
+      );
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // Default deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    match /flocks/{flockId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() &&
+                       incoming().createdBy == request.auth.uid &&
+                       incoming().code is string && incoming().code.size() > 0 &&
+                       incoming().initialCount is int && incoming().initialCount > 0;
+      allow update: if isSignedIn() && (isCreator() || isAdmin());
+      allow delete: if isSignedIn() && (isCreator() || isAdmin());
+    }
+
+    match /productionRecords/{recordId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() &&
+                       incoming().createdBy == request.auth.uid &&
+                       incoming().flockId is string && incoming().flockId.size() > 0 &&
+                       incoming().date is string;
+      allow update: if isSignedIn() && (isCreator() || isAdmin());
+      allow delete: if isSignedIn() && (isCreator() || isAdmin());
+    }
+
+    match /sales/{saleId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() &&
+                       incoming().createdBy == request.auth.uid &&
+                       incoming().date is string &&
+                       incoming().total is number && incoming().total > 0;
+      allow update: if isSignedIn() && (isCreator() || isAdmin());
+      allow delete: if isSignedIn() && (isCreator() || isAdmin());
+    }
+
+    match /expenses/{expenseId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() &&
+                       incoming().createdBy == request.auth.uid &&
+                       incoming().date is string &&
+                       incoming().amount is number && incoming().amount > 0;
+      allow update: if isSignedIn() && (isCreator() || isAdmin());
+      allow delete: if isSignedIn() && (isCreator() || isAdmin());
+    }
+
+    match /inventoryItems/{itemId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() &&
+                       incoming().createdBy == request.auth.uid &&
+                       incoming().name is string && incoming().name.size() > 0;
+      allow update: if isSignedIn();
+      allow delete: if isSignedIn() && (isCreator() || isAdmin());
+    }
+
+    match /stockMovements/{movementId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() &&
+                       incoming().createdBy == request.auth.uid &&
+                       incoming().quantity is number && incoming().quantity > 0;
+      allow update: if isSignedIn() && (isCreator() || isAdmin());
+      allow delete: if isSignedIn() && (isCreator() || isAdmin());
+    }
+
+    match /users/{userId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.auth.uid == userId;
+      allow update: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+      allow delete: if isAdmin();
+    }
+  }
+}

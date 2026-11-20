@@ -1,0 +1,816 @@
+# AGENTS.md — Royo Farm Manager · Android rebuild playbook
+
+This file is the single source of truth for an AI agent (or developer) asked to **reproduce the Royo Farm Manager app from scratch as a native Android Studio project in Kotlin, using Firebase**. It contains the full data model, security rules, business logic, screen-by-screen UI spec, project scaffold and an ordered build plan. Nothing else about the original web app is needed.
+
+> Target: a working, installable Android app with feature parity. No backend of your own — Firebase Auth + Cloud Firestore only.
+
+---
+
+## 0. Ground rules for the agent
+
+1. **Create a real Android Studio project** (Gradle KTS, Kotlin, Jetpack Compose, Material 3). Not a web app, not Compose Multiplatform, not Flutter.
+2. **Follow this document literally.** Everything the product needs is specified here. Do not add features, screens, payments, ads, AI chat or extra charts.
+3. **Parity means parity**, including the gaps listed in §12 — the original app has create + read only (no edit/delete UI), and its stock/production side effects are two separate writes.
+4. Build in the order of §11 and run the acceptance checklist (§13) before declaring done.
+5. UI text is **English**, currency **UGX**, dates **en-GB**, all date maths **UTC**.
+6. If a Firebase project/`google-services.json` is unavailable, still generate all code and Gradle config, leave a clearly labelled placeholder file and a `README_LOCAL_SETUP.md` explaining where to drop the real one.
+
+---
+
+## 1. Product
+
+A poultry-farm management app for a single farm ("Royo Farm", Uganda, currency UGX). Five things it does:
+
+1. **Flocks** — batches of birds: placement date, birds placed, birds alive, mortality, survival %, age.
+2. **Production** — daily eggs / broken eggs / birds lost / feed used per flock; logging mortality also decrements the flock's bird count.
+3. **Money** — sales (eggs, live birds, manure, other) and expenses in 7 categories.
+4. **Reporting** — 6-month revenue/expense/profit trend, next-month and next-3-month **profit forecast** (linear regression over monthly history), cost breakdown, eggs per month, profit per flock, CSV export.
+5. **Inventory** — feed/medication/equipment stock, in/out movements, reorder alerts, stock value.
+
+Two roles: **admin** (owner — full control, invites people) and **user** (staff — can add records, can only change/delete their own). Sign-in: email + password (with email verification) and Google. Nothing is public; signed-out users see nothing but the auth screens.
+
+---
+
+## 2. Tech stack
+
+| Concern | Choice |
+|---|---|
+| Language / UI | Kotlin 2.x, Jetpack Compose, Material 3 |
+| Min / target SDK | 26 / 35 |
+| Auth | Firebase Authentication — Email/Password + Google (`CredentialManager` / `GoogleIdTokenCredential`), `sendEmailVerification`, `sendPasswordResetEmail` |
+| Data | Cloud Firestore with `PersistentCacheSettings` (offline reads/writes) |
+| Architecture | MVVM: `ViewModel` + `StateFlow`, one repository per collection, Compose navigation |
+| Charts | **Vico** (compose-m3) — line + bar. If unavailable, draw with `Canvas`; do not add a second chart library. |
+| Dates | `java.time.LocalDate` / `YearMonth`, stored as ISO strings |
+| CSV | Build a `String`, write to `cacheDir`, share with `FileProvider` + `Intent.ACTION_SEND` (also offer `ACTION_CREATE_DOCUMENT` save) |
+| Async | Kotlin coroutines; `callbackFlow` / `.await()` wrappers over Firebase tasks |
+
+### Gradle (root `build.gradle.kts` + `settings.gradle.kts`)
+
+```kotlin
+// app/build.gradle.kts  (versions: use current stable if these are stale)
+plugins {
+    id("com.android.application") version "8.7.2"
+    id("org.jetbrains.kotlin.android") version "2.0.21"
+    id("org.jetbrains.kotlin.plugin.compose") version "2.0.21"
+    id("com.google.gms.google-services") version "4.4.2"
+}
+
+android {
+    namespace = "com.royo.farm"
+    compileSdk = 35
+    defaultConfig {
+        applicationId = "com.royo.farm"
+        minSdk = 26
+        targetSdk = 35
+        versionCode = 1
+        versionName = "1.0"
+    }
+    buildFeatures { compose = true }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = "17" }
+}
+
+dependencies {
+    val composeBom = platform("androidx.compose:compose-bom:2024.11.00")
+    implementation(composeBom)
+    implementation("androidx.core:core-ktx:1.13.1")
+    implementation("androidx.activity:activity-compose:1.9.3")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
+    implementation("androidx.navigation:navigation-compose:2.8.4")
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.material:material-icons-extended")
+    implementation("androidx.compose.ui:ui-tooling-preview")
+    debugImplementation("androidx.compose.ui:ui-tooling")
+
+    val firebaseBom = platform("com.google.firebase:firebase-bom:33.6.0")
+    implementation(firebaseBom)
+    implementation("com.google.firebase:firebase-auth-ktx")
+    implementation("com.google.firebase:firebase-firestore-ktx")
+
+    implementation("com.google.android.gms:play-services-auth:21.2.0")
+    implementation("androidx.credentials:credentials:1.3.0")
+    implementation("androidx.credentials:credentials-play-services-auth:1.3.0")
+    implementation("com.google.android.libraries.identity.googleid:googleid:1.1.1")
+
+    implementation("com.patrykandpatrick.vico:compose-m3:2.0.0")   // charts
+
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.9.0")
+    implementation("androidx.work:work-runtime-ktx:2.9.1")          // only if you batch anything
+}
+```
+
+---
+
+## 3. Package layout
+
+```
+com.royo.farm
+├── RoyoApp.kt                       // Application: enable Firestore persistence
+├── MainActivity.kt                  // setContent { RoyoTheme { RootNav() } }
+├── data
+│   ├── model/Models.kt              // Flock, ProductionRecord, Sale, Expense, InventoryItem, StockMovement, AppUser, enums
+│   ├── Firestore.kt                 // collection names, settings, task.await helpers
+│   └── repo/                        // AuthRepository, FlockRepository, ProductionRepository,
+│                                    // SalesRepository, ExpenseRepository, InventoryRepository
+├── domain
+│   ├── Constants.kt                 // category/product/unit option lists
+│   ├── Finance.kt                   // month bucketing, monthly series, regression, forecast
+│   ├── FarmMath.kt                  // survival, age, profit, low stock
+│   ├── Formatting.kt                // money(), num(), pct(), fmtDate()
+│   └── CsvExport.kt                 // 6-month report CSV
+├── ui
+│   ├── theme/Theme.kt, Color.kt, Type.kt
+│   ├── shell/RootNav.kt, AppShell.kt        // nav host + adaptive chrome
+│   ├── common/StatCard.kt, PageHeader.kt, EmptyState.kt, LoadingRows.kt, FieldRow.kt, AppDialog.kt
+│   ├── dashboard/DashboardScreen.kt, ProfitTrendChart.kt, ForecastCard.kt, FlockSnapshot.kt, RecentActivity.kt
+│   ├── flocks/FlockListScreen.kt, FlockDetailScreen.kt, FlockFormDialog.kt, FlockViewModel.kt
+│   ├── production/ProductionScreen.kt, ProductionFormDialog.kt, ProductionViewModel.kt
+│   ├── sales/SalesScreen.kt, SaleFormDialog.kt, SalesViewModel.kt
+│   ├── expenses/ExpensesScreen.kt, ExpenseFormDialog.kt, ExpensesViewModel.kt
+│   ├── inventory/InventoryScreen.kt, InventoryItemFormDialog.kt, StockMovementFormDialog.kt, InventoryViewModel.kt
+│   ├── reports/ReportsScreen.kt, ProfitTable.kt, ForecastTable.kt, FlockProfitList.kt, CategoryBarChart.kt
+│   ├── settings/SettingsScreen.kt, InviteDialog.kt
+│   └── auth/LoginScreen.kt, RegisterScreen.kt, ForgotPasswordScreen.kt, NotRegisteredScreen.kt
+└── res/xml/file_paths.xml           // FileProvider for CSV sharing
+```
+
+---
+
+## 4. Firestore data model
+
+Top-level collections, single farm (add `farmId` + filters only if you later go multi-farm). Every document also has `createdAt: Timestamp` (server timestamp) and `createdBy: String` (uid) — required by the security rules.
+
+**Date fields are ISO date strings (`"2026-11-03"`), not Timestamps.** Sort and bucket on strings.
+
+### 4.1 `flocks`
+
+| Field | Type | Required | Default | Notes |
+|---|---|---|---|---|
+| `code` | string | ✔ | — | Flock name, e.g. "Layers A · 2026" |
+| `breed` | string | | `""` | e.g. "Lohmann Brown" |
+| `type` | enum | | `layer` | `layer` \| `broiler` |
+| `house` | string | | `""` | House / pen |
+| `placementDate` | ISO date | ✔ | today | |
+| `initialCount` | int | ✔ | — | Birds placed |
+| `mortalityCount` | int | | `0` | Running total lost |
+| `currentCount` | int | | = initialCount | Birds alive |
+| `status` | enum | | `active` | `active` \| `closed` |
+| `notes` | string | | `""` | |
+
+### 4.2 `productionRecords`
+
+| Field | Type | Required | Default |
+|---|---|---|---|
+| `date` | ISO date | ✔ | today |
+| `flockId` | string | ✔ | — |
+| `flockCode` | string | | denormalized `flocks.code` |
+| `eggsCollected` | number | | `0` |
+| `eggsBroken` | number | | `0` |
+| `mortality` | number | | `0` |
+| `feedUsedKg` | double | | `0` |
+| `notes` | string | | `""` |
+
+### 4.3 `sales`
+
+| Field | Type | Required | Default |
+|---|---|---|---|
+| `date` | ISO date | ✔ | today |
+| `product` | enum | ✔ | `eggs` — `eggs` \| `live_birds` \| `manure` \| `other` |
+| `description` | string | | `""` |
+| `quantity` | number | | `0` |
+| `unit` | string | | `"tray"` |
+| `unitPrice` | number | | `0` |
+| `total` | number | ✔ | `quantity * unitPrice` when left blank |
+| `customer` | string | | `"Walk-in customer"` |
+| `flockId` | string | | `""` |
+| `flockCode` | string | | `""` |
+| `paymentStatus` | enum | ✔ | `paid` — `paid` \| `pending` |
+
+### 4.4 `expenses`
+
+| Field | Type | Required | Default |
+|---|---|---|---|
+| `date` | ISO date | ✔ | today |
+| `category` | enum | ✔ | `feed` — `feed` \| `medication` \| `labour` \| `utilities` \| `equipment` \| `transport` \| `other` |
+| `description` | string | | `""` |
+| `amount` | number | ✔ | — |
+| `vendor` | string | | `""` |
+| `flockId` | string | | `""` (empty = general farm cost) |
+| `flockCode` | string | | `""` |
+
+### 4.5 `inventoryItems`
+
+| Field | Type | Required | Default |
+|---|---|---|---|
+| `name` | string | ✔ | — |
+| `category` | enum | | `feed` — `feed` \| `medication` \| `equipment` \| `other` |
+| `unit` | string | ✔ | `"bag"` |
+| `quantity` | number | | `0` |
+| `reorderLevel` | number | | `0` |
+| `unitCost` | number | | `0` |
+
+### 4.6 `stockMovements`
+
+| Field | Type | Required | Default |
+|---|---|---|---|
+| `itemId` | string | ✔ | — |
+| `itemName` | string | | denormalized item name |
+| `type` | enum | ✔ | `out` — `in` \| `out` |
+| `quantity` | number | ✔ | — (must be > 0) |
+| `date` | ISO date | ✔ | today |
+| `note` | string | | `""` |
+
+### 4.7 `users/{uid}`
+
+```kotlin
+data class AppUser(
+    val uid: String = "",
+    val fullName: String = "",
+    val email: String = "",
+    val role: FarmRole = FarmRole.USER,
+    val createdAt: Timestamp? = null
+)
+enum class FarmRole { ADMIN, USER }
+```
+
+Create the doc on first sign-in (or via an Auth `onCreate` Cloud Function) using `displayName`/`email`. The **first** account becomes `ADMIN`; everything else `USER`. Mirror the role into a custom claim `role` (`admin` / `user`) via the Admin SDK whenever it changes — Security Rules read the claim, not the document. Role labels in UI: admin → "Farm owner", user → "Farm staff".
+
+### Kotlin models
+
+```kotlin
+data class Flock(
+    @DocumentId val id: String = "",
+    val code: String = "",
+    val breed: String = "",
+    val type: FlockType = FlockType.LAYER,
+    val house: String = "",
+    val placementDate: String = "",
+    val initialCount: Int = 0,
+    val mortalityCount: Int = 0,
+    val currentCount: Int = 0,
+    val status: FlockStatus = FlockStatus.ACTIVE,
+    val notes: String = "",
+    val createdAt: Timestamp? = null,
+    val createdBy: String = ""
+)
+enum class FlockType { LAYER, BROILER }
+enum class FlockStatus { ACTIVE, CLOSED }
+
+data class ProductionRecord(
+    @DocumentId val id: String = "",
+    val date: String = "",
+    val flockId: String = "",
+    val flockCode: String = "",
+    val eggsCollected: Double = 0.0,
+    val eggsBroken: Double = 0.0,
+    val mortality: Double = 0.0,
+    val feedUsedKg: Double = 0.0,
+    val notes: String = "",
+    val createdAt: Timestamp? = null,
+    val createdBy: String = ""
+)
+
+data class Sale(
+    @DocumentId val id: String = "",
+    val date: String = "",
+    val product: String = "eggs",
+    val description: String = "",
+    val quantity: Double = 0.0,
+    val unit: String = "tray",
+    val unitPrice: Double = 0.0,
+    val total: Double = 0.0,
+    val customer: String = "",
+    val flockId: String = "",
+    val flockCode: String = "",
+    val paymentStatus: String = "paid",
+    val createdAt: Timestamp? = null,
+    val createdBy: String = ""
+)
+
+data class Expense(
+    @DocumentId val id: String = "",
+    val date: String = "",
+    val category: String = "feed",
+    val description: String = "",
+    val amount: Double = 0.0,
+    val vendor: String = "",
+    val flockId: String = "",
+    val flockCode: String = "",
+    val createdAt: Timestamp? = null,
+    val createdBy: String = ""
+)
+
+data class InventoryItem(
+    @DocumentId val id: String = "",
+    val name: String = "",
+    val category: String = "feed",
+    val unit: String = "bag",
+    val quantity: Double = 0.0,
+    val reorderLevel: Double = 0.0,
+    val unitCost: Double = 0.0
+)
+
+data class StockMovement(
+    @DocumentId val id: String = "",
+    val itemId: String = "",
+    val itemName: String = "",
+    val type: String = "out",
+    val quantity: Double = 0.0,
+    val date: String = "",
+    val note: String = "",
+    val createdAt: Timestamp? = null,
+    val createdBy: String = ""
+)
+```
+
+Use `@PropertyName` / a `DocumentSnapshot.toObject(Flock::class.java)` with `@DocumentId`, and `@ServerTimestamp` on `createdAt` where you prefer annotations.
+
+---
+
+## 5. Security rules, indexes, offline
+
+### 5.1 `firestore.rules`
+
+Read + create: any farm member (`role` claim `admin` or `user`). Update/delete: the creator or an admin. Nothing is readable signed-out.
+
+```javascript
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{db}/documents {
+    function signedIn() { return request.auth != null; }
+    function isMember() { return signedIn() && request.auth.token.role in ['admin','user']; }
+    function isAdmin()  { return signedIn() && request.auth.token.role == 'admin'; }
+    function ownsIt()   { return signedIn() && resource.data.createdBy == request.auth.uid; }
+
+    match /flocks/{id} {
+      allow read: if isMember();
+      allow create: if isMember() && request.resource.data.createdBy == request.auth.uid;
+      allow update, delete: if ownsIt() || isAdmin();
+    }
+    // identical block for: productionRecords, sales, expenses, inventoryItems, stockMovements
+
+    match /users/{uid} {
+      allow read: if isMember();
+      allow create: if signedIn() && request.auth.uid == uid
+                    && request.resource.data.role == 'user';
+      allow update: if (request.auth.uid == uid
+                        && request.resource.data.role == resource.data.role) || isAdmin();
+      allow delete: if isAdmin();
+    }
+  }
+}
+```
+
+Deploy with `firebase deploy --only firestore:rules` and paste the same ruleset into the console if you are not using the CLI.
+
+### 5.2 Composite indexes (`firestore.indexes.json`)
+
+```json
+{ "indexes": [
+  { "collectionGroup": "productionRecords",
+    "queryScope": "COLLECTION",
+    "fields": [ { "fieldPath": "flockId", "order": "ASCENDING" },
+                { "fieldPath": "date", "order": "DESCENDING" } ] }
+], "fieldOverrides": [] }
+```
+
+### 5.3 Queries (keep these limits; they match the original screens)
+
+| Screen | Query |
+|---|---|
+| Flocks list | `flocks` `orderBy("placementDate", DESC)` `limit(200)` → client-sort active first |
+| Flock detail production | `productionRecords` `whereEqualTo("flockId", id)` `orderBy("date", DESC)` `limit(200)` |
+| Production page | `productionRecords` `orderBy("date", DESC)` `limit(300)` |
+| Sales | `sales` `orderBy("date", DESC)` `limit(500)` |
+| Expenses | `expenses` `orderBy("date", DESC)` `limit(500)` |
+| Inventory | `inventoryItems` `orderBy("name")` `limit(200)` |
+| Movements | `stockMovements` `orderBy("date", DESC)` `limit(40)` |
+| Dashboard | sales 500, expenses 500, production 200, flocks 200 |
+
+Enable offline persistence in `RoyoApp.onCreate`:
+
+```kotlin
+FirebaseFirestore.getInstance().firestoreSettings =
+    FirebaseFirestoreSettings.Builder()
+        .setLocalCacheSettings(PersistentCacheSettings.newBuilder().build())
+        .build()
+```
+
+---
+
+## 6. Constants (`domain/Constants.kt`)
+
+```kotlin
+const val CURRENCY = "UGX"
+
+val FLOCK_TYPES = listOf("layer" to "Layers · table eggs", "broiler" to "Broilers · meat")
+val PRODUCTS = listOf("eggs" to "Eggs", "live_birds" to "Live birds",
+                      "manure" to "Manure", "other" to "Other")
+val EXPENSE_CATEGORIES = listOf(
+    "feed" to "Feed", "medication" to "Medication & vaccines", "labour" to "Labour",
+    "utilities" to "Utilities", "equipment" to "Equipment", "transport" to "Transport",
+    "other" to "Other")
+val INVENTORY_CATEGORIES = listOf("feed" to "Feed", "medication" to "Medication",
+                                  "equipment" to "Equipment", "other" to "Other")
+val UNITS = listOf("tray", "egg", "bird", "kg", "bag", "vial", "litre", "piece")
+
+fun labelOf(options: List<Pair<String, String>>, value: String?) =
+    options.firstOrNull { it.first == value }?.second ?: value?.replace('_', ' ') ?: "—"
+```
+
+---
+
+## 7. Formatting (`domain/Formatting.kt`)
+
+```kotlin
+private val nf0 = NumberFormat.getNumberInstance(Locale.US).apply { maximumFractionDigits = 0 }
+private val nfD = NumberFormat.getNumberInstance(Locale.US)
+
+fun money(v: Double, compact: Boolean = false): String {
+    return if (!compact) "UGX ${nf0.format(v)}"
+    else when {
+        abs(v) >= 10_000_000 -> "UGX ${nfD.apply { maximumFractionDigits = 1 }.format(v / 1_000_000)}M"
+        abs(v) >= 1_000_000  -> "UGX ${nfD.apply { maximumFractionDigits = 2 }.format(v / 1_000_000)}M"
+        abs(v) >= 1_000      -> "UGX ${nf0.format(v / 1_000)}K"
+        else                 -> "UGX ${nf0.format(v)}"
+    }
+}
+fun num(v: Double, digits: Int = 0): String = nfD.apply { maximumFractionDigits = digits }.format(v)
+fun pct(v: Double, digits: Int = 1): String = "${nfD.apply { maximumFractionDigits = digits }.format(v)}%"
+fun todayISO(): String = LocalDate.now(ZoneOffset.UTC).toString()
+fun fmtDate(iso: String?): String =
+    runCatching { LocalDate.parse(iso).format(DateTimeFormatter.ofPattern("dd MMM yyyy", Locale.UK)) }
+        .getOrDefault("—")
+fun fmtDateShort(iso: String?): String =
+    runCatching { LocalDate.parse(iso).format(DateTimeFormatter.ofPattern("dd MMM", Locale.UK)) }
+        .getOrDefault("—")
+```
+
+- Amounts are whole shillings in the UI; keep doubles in Firestore, round when displaying and in CSV.
+- Numbers use tabular figures (`FontFeature("tnum")`) so columns align.
+- Never format dates with the device locale — always `Locale.UK` / UTC.
+
+---
+
+## 8. Business logic — implement exactly
+
+### 8.1 Derived values (`domain/FarmMath.kt`)
+
+```kotlin
+fun survivalPct(initial: Double, current: Double) = if (initial > 0) current / initial * 100 else 0.0
+
+fun birdAgeDays(placementDate: String?, today: LocalDate = LocalDate.now(ZoneOffset.UTC)): Int =
+    runCatching { ChronoUnit.DAYS.between(LocalDate.parse(placementDate), today).toInt() }
+        .getOrDefault(0).coerceAtLeast(0)
+
+fun isLowStock(item: InventoryItem) = item.quantity <= item.reorderLevel
+
+data class FlockMoney(val revenue: Double, val cost: Double) { val profit get() = revenue - cost }
+
+fun flockMoney(flockId: String, sales: List<Sale>, expenses: List<Expense>) = FlockMoney(
+    revenue = sales.filter { it.flockId == flockId }.sumOf { it.total },
+    cost = expenses.filter { it.flockId == flockId }.sumOf { it.amount })
+```
+
+### 8.2 Writes with side effects (must behave like this)
+
+**Log production** — insert the record; **if `mortality > 0`**, also update the flock (`mortalityCount += mortality`, `currentCount = max(0, currentCount − mortality)`).
+
+```kotlin
+suspend fun logProduction(record: ProductionRecord, flock: Flock) {
+    productionCol().add(record.withAudit()).await()
+    val lost = record.mortality
+    if (lost > 0) {
+        flockCol().document(flock.id).update(
+            mapOf("mortalityCount" to (flock.mortalityCount + lost.toInt()),
+                  "currentCount" to max(0, flock.currentCount - lost.toInt()))
+        ).await()
+    }
+}
+```
+
+**Create flock** — `currentCount = initialCount`, `mortalityCount = 0`, `status = active`.
+
+**Stock movement** — insert the movement and update the item in one transaction:
+
+```kotlin
+suspend fun recordMovement(item: InventoryItem, type: String, qty: Double, date: String, note: String) {
+    val db = FirebaseFirestore.getInstance()
+    db.runTransaction { tx ->
+        val ref = db.collection("inventoryItems").document(item.id)
+        val fresh = tx.get(ref).toObject(InventoryItem::class.java)!!
+        val next = max(0.0, fresh.quantity + if (type == "in") qty else -qty)
+        tx.update(ref, "quantity", next)
+        tx.set(db.collection("stockMovements").document(),
+               StockMovement(itemId = item.id, itemName = fresh.name, type = type,
+                             quantity = qty, date = date, note = note).withAudit())
+        null
+    }.await()
+}
+```
+
+### 8.3 Validation (inline field error or toast; submit disabled while saving)
+
+| Form | Rule |
+|---|---|
+| Flock | name not blank, `initialCount > 0` |
+| Production | a flock must be selected |
+| Sale | `total > 0` (entered, or `quantity * unitPrice > 0`) |
+| Expense | `amount > 0` |
+| Inventory item | name not blank |
+| Stock movement | `quantity > 0` |
+
+Success toasts: "Flock added", "Production logged", "Sale recorded", "Expense recorded", "Item added to inventory", "Stock received" / "Stock issued".
+
+### 8.4 Month bucketing (`domain/Finance.kt`)
+
+Window = the **last 6 calendar months including the current one**, oldest first. Short label `"Nov"`, full label `"November 2026"`.
+
+```kotlin
+object Finance {
+    const val WINDOW = 6
+
+    fun monthKey(iso: String?): String = iso?.take(7) ?: ""
+
+    data class MonthPoint(val key: String, val label: String, val full: String,
+                          val revenue: Double, val expenses: Double) {
+        val profit get() = revenue - expenses
+    }
+
+    fun windowMonths(months: Int = WINDOW, today: YearMonth = YearMonth.now(ZoneOffset.UTC)): List<YearMonth> =
+        (months - 1 downTo 0).map { today.minusMonths(it.toLong()) }
+
+    fun monthlySeries(sales: List<Sale>, expenses: List<Expense>, months: Int = WINDOW): List<MonthPoint> {
+        val byRev = sales.groupBy { monthKey(it.date) }.mapValues { e -> e.value.sumOf { it.total } }
+        val byExp = expenses.groupBy { monthKey(it.date) }.mapValues { e -> e.value.sumOf { it.amount } }
+        return windowMonths(months).map { ym ->
+            val key = ym.toString() // yyyy-MM
+            MonthPoint(
+                key = key,
+                label = ym.format(DateTimeFormatter.ofPattern("MMM", Locale.UK)),
+                full = ym.format(DateTimeFormatter.ofPattern("MMMM yyyy", Locale.UK)),
+                revenue = byRev[key] ?: 0.0,
+                expenses = byExp[key] ?: 0.0)
+        }
+    }
+}
+```
+
+### 8.5 Forecast — linear least squares (the core "smart" feature)
+
+Fit each series separately with `x = 0..n-1`:
+
+```
+slope     = Σ(x−x̄)(y−ȳ) / Σ(x−x̄)²      (0 if the denominator is 0)
+intercept = ȳ − slope·x̄
+SSres     = Σ(y − (intercept + slope·x))²
+SStot     = Σ(y − ȳ)²
+r²        = SStot > 0 ? max(0, 1 − SSres/SStot) : 0
+projection(step) = max(0, intercept + slope·step)
+```
+
+- Projected revenue / expenses use their own fits at `step = n + i` (`i = 0..h-1`).
+- Projected profit = projected revenue − projected expenses.
+- **Confidence = min(r² revenue, r² expenses)**, shown as a whole percentage.
+- Dashboard forecast: `h = 1` (next month, labelled with its full month name); card caption "Projected net profit, based on the last 6 months of actual results."
+- Direction of the first projected month vs. the last actual month:
+  `flat` if `|first.profit − last.profit| < max(20_000, |last.profit| * 0.05)`; else `up` / `down`.
+  Chips: Rising (up arrow) / Steady (minus) / Declining (down arrow).
+
+```kotlin
+data class Fit(val slope: Double, val intercept: Double, val r2: Double)
+fun fit(ys: List<Double>): Fit {
+    val n = ys.size
+    if (n < 2) return Fit(0.0, ys.firstOrNull() ?: 0.0, 0.0)
+    val xs = List(n) { it.toDouble() }
+    val xb = xs.average(); val yb = ys.average()
+    val den = xs.sumOf { (it - xb) * (it - xb) }
+    val slope = if (den == 0.0) 0.0 else xs.zip(ys).sumOf { (x, y) -> (x - xb) * (y - yb) } / den
+    val icpt = yb - slope * xb
+    val ssRes = xs.zip(ys).sumOf { (x, y) -> val e = y - (icpt + slope * x); e * e }
+    val ssTot = ys.sumOf { val d = it - yb; d * d }
+    val r2 = if (ssTot > 0) (1 - ssRes / ssTot).coerceAtLeast(0.0) else 0.0
+    return Fit(slope, icpt, r2)
+}
+
+data class ProjectedMonth(val key: String, val label: String, val full: String,
+                          val revenue: Double, val expenses: Double) { val profit get() = revenue - expenses }
+
+data class ForecastReport(
+    val projected: List<ProjectedMonth>,       // horizon length
+    val confidence: Double,                    // 0..1
+    val direction: String,                     // "up" | "down" | "flat"
+    val months: Int = Finance.WINDOW
+) {
+    val next get() = projected.first()
+    val projectedProfit get() = next.profit
+    val projectedRevenue get() = next.revenue
+    val projectedExpenses get() = next.expenses
+    val nextLabel get() = projected.firstOrNull()?.let { it.full.substringBefore(" ") } ?: "Next month"
+}
+
+fun forecast(series: List<Finance.MonthPoint>, horizon: Int = 1,
+             today: YearMonth = YearMonth.now(ZoneOffset.UTC)): ForecastReport {
+    val fr = fit(series.map { it.revenue })
+    val fe = fit(series.map { it.expenses })
+    val n = series.size
+    val projected = (0 until horizon).map { i ->
+        val ym = today.plusMonths(i + 1L)
+        val step = (n + i).toDouble()
+        ProjectedMonth(
+            key = ym.toString(),
+            label = ym.format(DateTimeFormatter.ofPattern("MMM", Locale.UK)),
+            full = ym.format(DateTimeFormatter.ofPattern("MMMM yyyy", Locale.UK)),
+            revenue = (fr.intercept + fr.slope * step).coerceAtLeast(0.0),
+            expenses = (fe.intercept + fe.slope * step).coerceAtLeast(0.0))
+    }
+    val last = series.lastOrNull()?.profit ?: 0.0
+    val first = projected.first().profit
+    val delta = first - last
+    val direction = when {
+        abs(delta) < maxOf(20_000.0, abs(last) * 0.05) -> "flat"
+        first > last -> "up"
+        else -> "down"
+    }
+    return ForecastReport(projected, minOf(fr.r2, fe.r2), direction)
+}
+```
+
+### 8.6 CSV export (`domain/CsvExport.kt`)
+
+File name `royo-farm-report.csv`. Every cell quoted; amounts rounded to whole shillings.
+
+```
+Royo Farm — 6 month report,,,
+Generated {dd MMM yyyy},,,
+,
+Month,Revenue (UGX),Expenses (UGX),Profit (UGX)
+{November 2026},{revenue},{expenses},{profit}      ← one row per month, oldest first
+,
+Forecast,Revenue (UGX),Expenses (UGX),Profit (UGX)
+{next months, 3 rows from forecast(h = 3)},{revenue},{expenses},{profit}
+```
+
+Write to `context.cacheDir/royo-farm-report.csv`, expose via `FileProvider` (`res/xml/file_paths.xml`: `<cache-path name="reports" path="."/>`), share with `Intent.ACTION_SEND`, type `text/csv`, subject "Royo Farm report".
+
+---
+
+## 9. Design
+
+Reproduce this look — it is not a generic Material template.
+
+| Token | Value | Use |
+|---|---|---|
+| background | warm off-white `#FAF7F1` | page background |
+| card / surface | `#FFFFFF`, 1dp border `#E7E1D6`, 16dp radius, soft shadow | cards, panels |
+| primary | deep forest green `#1E4A38` | primary buttons, positive figures, forecast card fill, active nav |
+| onPrimary | `#FAF7F1` | text on green |
+| accent | warm amber `#C4762A` | active-nav underline, small highlights, icons on green |
+| destructive | brick red `#C1372F` | negative profit, low-stock badge |
+| muted text | `#66756C` | captions, helper text |
+| display type | a serif display face (`FontFamily.Serif` fallback) | page titles, stat values, big money |
+| body type | humanist sans (default `SansSerif` / Roboto) | everything else |
+
+Layout rules: cards with 20dp padding; 12–16dp gaps; stat grid 2 columns on phone, 4 on tablet (≥600dp); max content width ~1100dp centred; section headings are display-serif and slightly tracked; every list has a loading skeleton and an empty state with an icon + one-line CTA.
+
+---
+
+## 10. Screens (exact content)
+
+Shell: phone → bottom `NavigationBar` (Dashboard, Flocks, Production, Sales, Reports) + top app bar with farm name, hamburger opening a drawer (Inventory, Expenses, Reports, Settings, profile name + role label, Sign out). Tablet → persistent `NavigationRail`/drawer with all 8 destinations. Forms open as `ModalBottomSheet` (phone) / `Dialog` (tablet); a floating/FAB or header button opens them.
+
+### 10.1 Dashboard (`dashboard`)
+
+1. Greeting: "Good day, {firstName}" (from `AppUser.fullName` first word, fallback "Good day"), subtitle "Your flock and the money it makes, at a glance." Header action: **Log production**.
+2. Four stat cards: **Active birds** = Σ `currentCount` where `status != closed`, sub "{n} flock(s) in production"; **Eggs this week** = Σ `eggsCollected` where `date >= today − 7d`, sub "Last 7 days"; **Revenue this month**, sub "Recorded sales"; **Net profit** = this-month revenue − expenses, sub "After {money} spend", accent styling, value red when negative.
+3. **Profit & loss trend** card: 6-month chart (revenue and expenses series, plus a profit line/derived line), caption "{oldest} – {newest}", link "Full report" → reports.
+4. **Forecast card** (filled primary green, white text): eyebrow "FORECAST · {Next Month}"; direction chip; big projected net profit (compact money); caption "Projected net profit, based on the last 6 months of actual results."; three rows: Projected revenue, Projected expenses, Trend confidence {%}; footnote "An estimate from history — not a guarantee."
+5. **Flock snapshot** card: first 3 active flocks, each "{code}" + "{birds alive} birds · {survival%} survival" + progress bar; link "All flocks"; empty hint with "Add your first flock".
+6. **Recent activity** card: last 5 merged sales (+) and expenses (−) sorted by date desc; title = description or product/category label; detail = "{date} · {customer|vendor}" (+ "{flock}" when linked); right-aligned signed amount (green +, red −). Empty hint "Record a sale or expense to see it here."
+
+### 10.2 Flocks (`flocks`)
+
+Header eyebrow "Poultry", title "Flocks", description "Every batch of birds on the farm, with survival, age and current numbers." Action **New flock**.
+Cards (1 col phone / 2 tablet): code (display serif), `{breed or "Mixed breed"} · {house or "Main house"}`, type badge (Layers/Broilers, filled for active), three figures — birds alive, days old, survival % — survival progress bar, footer "Placed {date} · {n} lost". Tap → flock detail. Empty state: "No flocks yet" + "Add your first flock to start tracking production, feed and flock performance" + button.
+
+### 10.3 Flock detail (`flocks/{flockId}`)
+
+Back link "All flocks". Eyebrow `{breed} · {house}`, title = code, description "Placed {date} · {n} days in production", action **Log production** (flock preselected).
+Four stat cards: **Birds alive** (`current {n} of {initial} placed`), **Survival** (`{pct} · {mortality} lost`), **Eggs collected** (all records for this flock), **Flock net result** (profit, sub "{revenue} revenue · {cost} cost", red when negative).
+**Eggs per day** card: line chart of the flock's newest 14 production records (chronological); if fewer than 2 records show "Log production to see the trend."
+**Flock facts** card: Type, Feed used (kg, 1 dp), Recorded costs, Status ("In production"/"Closed"), plus Notes when present.
+**Production history** card: newest 12 records — left "{date}" and "{feed} kg feed{fewer when 0}", right-aligned "{eggs} eggs", plus "· {n} lost" and "· {n} broken" when non-zero.
+Not found → message "This flock no longer exists" + "Back to flocks".
+
+### 10.4 Production (`production`)
+
+Header eyebrow "Daily log", title "Production", description "Eggs, birds lost and feed used — recorded flock by flock." Action **Log production**.
+Three stats: Eggs last 7 days ("Across all flocks"), Birds lost ("Last 7 days"), Feed used ("Last 7 days", 1 dp, sub "Kilograms"). Optional 4th: Average eggs/day.
+**Daily egg output** card: chart of daily egg totals across flocks over the last 14 days, built from the newest 60 records; caption "{n} days logged"; empty hint "Log production to see egg output."
+**Production log** card: newest 40 rows — left "{flockCode}", right "{eggs} eggs", small line "{date} · {feed} kg feed · {lost} lost".
+
+### 10.5 Sales (`sales`)
+
+Header eyebrow "Revenue", title "Sales", description "Eggs, birds and manure sold — every shilling of income in one place." Action **Record sale**.
+Three stats: Revenue this month ("Recorded sales"), Awaiting payment (Σ all `pending`, sub "Marked pending"), Sales on file ("All time", count).
+**Sales ledger**: newest 50 rows — title = description or product label; "{date} · {customer|Walk-in} · {quantity} {unit}"; "Pending" badge when pending; right total (money).
+
+### 10.6 Expenses (`expenses`)
+
+Header eyebrow "Costs", title "Expenses", description "Feed, medication, labour and overheads — the cost side of farm performance." Action **Add expense**.
+Three stats: Spent this month ("All categories"), Largest cost (its category label), Expenses on file ("All time").
+**Costs by category** card: horizontal bar chart of this month's spend per category, descending, caption "{n} categories".
+**Expense ledger**: newest 50 — "{description or category label}", "{date} · {vendor|"Not recorded"} · {flock|"General farm cost"}", right amount.
+
+### 10.7 Inventory (`inventory`)
+
+Header eyebrow "Store", title "Inventory", description "Feed, medication and equipment — know what's on hand before you run out." Actions **New item**, **Stock movement**.
+Three stats: Items tracked ("Across the store"), Stock value (Σ `quantity × unitCost`, "At unit cost"), Needs reordering (count where `quantity <= reorderLevel`, sub "At or below reorder level").
+Item list: name; "{category} · per {unit}"; right "{quantity} {unit}" + "Reorder" badge when low; small line "{unit cost} each".
+**Movement history**: newest 40 — "{itemName}", "{date} · {note}"; right "{+qty | −qty} {unit-ish}" coloured green/neutral for in, red for out; type chip "In"/"Out".
+Empty state: "Nothing in the store yet" with the two CTAs.
+
+### 10.8 Reports (`reports`)
+
+Header eyebrow "Insight", title "Reports", description "Six months of performance, the next three projected, and the detail behind both." Action **Export CSV** (shows a spinner while writing, toast "Report exported").
+Four stats: 6-month revenue, 6-month expenses, net profit, average monthly profit ("{n} months averaged").
+1. **Revenue vs expenses** card + 6-row P&L table: Month | Revenue | Expenses | Profit/loss | Margin (`profit/revenue*100`, 0% when revenue = 0; profit column green/red).
+2. **Forecast card** (same as dashboard) + **Forecast next 3 months** table: Month | Projected revenue | Projected costs | Projected profit; footnote "Projections fit a straight line through the last {n} months of actuals. Treat them as a direction of travel, not a promise."
+3. **Costs by category · last 90 days** bar chart, descending; caption "Where the money went".
+4. **Eggs per month** line chart (6 months) + caption "{total} eggs over 6 months".
+5. **Profit by flock** list sorted by profit desc: code (tappable → detail), "{revenue} revenue · {cost} cost", right profit; empty hint "Add flocks, sales and costs to see profit per flock."
+
+### 10.9 Settings (`settings`)
+
+Header eyebrow "Account", title "Profile & team", description "Your sign-in details, farm records and the people who help run the farm."
+- **Profile** card: full name (display serif), email, role chip ("Farm owner" / "Farm staff"), **Sign out** button.
+- **Farm records** card: counts — flocks, production logs, sales, expenses (+ inventory items on a second row).
+- **Team** card (admin only): email field + role selector (Farm staff / Owner / admin) + **Send invite**; helper "Staff can log production, sales and expenses. Owners and admins can also edit or remove any record." Success toast "Invite sent to {email}". Non-admins see a note that an owner must invite teammates.
+- Invitation implementation: Cloud Function callable `inviteUser(email, role)` using Admin SDK `createUser` + a Firebase Auth email link, or write a `users` doc with `role` and let the person register (then the role is applied on first sign-in). Do not fake it.
+
+### 10.10 Auth screens
+
+- **Login**: email, password, "Sign in", Google button, "Forgot password?" link, "Create an account" link.
+- **Register**: full name, email, password, "Create account" → Firebase creates the account (displayName set) → **verification step**: "Check your inbox — verify your email, then continue" with "Resend email" and "I've verified". Only after `user.isEmailVerified` does the app proceed.
+- **Forgot password**: email → `sendPasswordResetEmail` → always show the same generic success message regardless of whether the address exists.
+- **Not registered**: a verified Firebase account with no `users/{uid}` doc and no `role` claim sees "You're not registered for this app" + "Contact the farm owner for access" + Sign out. (If you auto-create the user doc on first sign-in, this state applies only to accounts created outside the app.)
+- All auth errors inline under the field, submit disabled while in flight.
+
+---
+
+## 11. Build order
+
+Do these phases in order; each ends compilable and runnable.
+
+1. **Project + theme.** Gradle, `google-services.json`, `RoyoTheme` with §9 tokens and a serif display font, `MainActivity`, empty `RootNav`. Verify: app launches with a themed placeholder.
+2. **Models + Firestore layer.** `Models.kt`, collection constants, `.await()` helpers, persistence enabled, security rules + index deployed.
+3. **Auth.** `AuthRepository` (email/password, Google via CredentialManager, verification, reset, `me()` reading `users/{uid}` + forcing `getIdToken(true)` to pick up the `role` claim), Login/Register/Forgot screens, session state in a root `AuthViewModel`, gate in `RootNav` (signed out → auth graph; signed in → app shell). Verify: register → verify → lands on dashboard; sign out returns to login.
+4. **Domain.** `Constants.kt`, `Formatting.kt`, `FarmMath.kt`, `Finance.kt` (fit + forecast), `CsvExport.kt`. Add a plain JVM unit test for `fit`/`forecast` using a known 6-month series (e.g. revenue 1,000,000 → 2,000,000 increasing; assert slope > 0, r² near 1, projections monotonic).
+5. **Flocks.** Repository, list, create dialog, detail with production history + eggs chart. Verify: create flock → appears with `initialCount` birds, 100% survival, 0 days old.
+6. **Production.** Repository (with the mortality side effect), screen + chart, form with flock selector. Verify: logging 5 lost birds drops birds alive by 5 and raises mortality; survival % updates everywhere.
+7. **Sales + Expenses.** Repositories, ledgers, stats, category chart. Verify: a sale raises month revenue on dashboard/sales/reports; an expense raises costs and lowers profit.
+8. **Dashboard.** All six sections wired to the same repositories; empty-state pass with a brand-new database.
+9. **Reports.** Series, tables, forecast (h = 3), eggs chart, profit by flock, CSV export + share sheet. Verify numbers match the dashboard for the current month.
+10. **Inventory.** Items, stock movement transaction, reorder badges and stat, movement history.
+11. **Settings.** Profile, record counts, sign out, admin invite.
+12. **Polish + QA.** Skeleton loaders, empty states everywhere, tablet two-column layouts, dark-safe contrast on the green forecast card, offline behaviour (airplane mode → cached reads still render), and the acceptance checklist in §13.
+
+---
+
+## 12. Parity notes (deliberate gaps in the original)
+
+- **Create + read only.** There is no edit or delete UI for flocks, production records, sales, expenses, items or movements, and no screen sets a flock to `closed` (the status field exists for reporting). Do not add those unless the user asks; the security rules already allow the creator/admin to edit if it is added later.
+- Flock numbers change only through the production log; there is no manual "adjust birds" action.
+- No notifications, no payments, no photos, no multi-farm, no currency switching, no i18n.
+- Data is farm-wide: every member sees every record (the original design), so the app is **invite-only** — keep sign-up closed to strangers in Firebase (Auth settings or the "not registered" gate).
+
+---
+
+## 13. Definition of done — acceptance checklist
+
+- [ ] Register → email verification → sign in works; Google sign-in works; reset password sends mail; signed-out users reach nothing but auth screens.
+- [ ] Creating a flock stores `currentCount = initialCount`, `mortalityCount = 0`, `status = active`; list shows active flocks first, with birds, days old, survival %.
+- [ ] Logging production with mortality updates the flock's `currentCount` and `mortalityCount`; survival drops on the list, detail and dashboard snapshot.
+- [ ] Production form pre-selects the flock when opened from flock detail.
+- [ ] Sales count as revenue; pending sales appear in "Awaiting payment" and are excluded from nothing else (they are still revenue).
+- [ ] Expenses with no flock count in totals and in the category chart but not in per-flock profit.
+- [ ] Six-month buckets include empty months as zeros; nothing older than 6 months appears.
+- [ ] Forecast equals the §8.5 formula for the same inputs, clamps at zero, confidence = min(r²), direction thresholds applied.
+- [ ] Stock in/out clamps `quantity` at 0, writes the movement, and flips the reorder badge when crossing `reorderLevel`.
+- [ ] CSV export produces exactly the §8.6 rows and opens the Android share sheet.
+- [ ] Money always renders as `UGX …` with grouping; negative profit is red; numbers are tabular.
+- [ ] Every list has a loading skeleton and an empty state with a working CTA.
+- [ ] Tablet (≥600dp) uses the rail + multi-column grids; phone uses bottom nav + single column; nothing is clipped at 320dp.
+- [ ] Offline: with the network off, previously loaded data still renders and a queued write appears after reconnect.
+- [ ] `./gradlew assembleDebug` succeeds with no warnings about missing google-services config, and the app runs on an API 26 emulator and a current device.
+
+---
+
+## 14. Optional extras (only if explicitly requested later)
+
+Editing/deleting records (rules already permit it), closing a flock, a date-range filter on sales/expenses, push notifications for reorder alerts, PDF export, multi-farm support with `farmId` + rules change. None of these are part of this build.

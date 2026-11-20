@@ -1,0 +1,155 @@
+{
+  "entities": {
+    "Flock": {
+      "title": "Flock",
+      "description": "A batch of birds placed on the farm",
+      "type": "object",
+      "properties": {
+        "code": { "type": "string", "description": "Flock code or name" },
+        "breed": { "type": "string", "description": "Breed of birds" },
+        "type": { "type": "string", "enum": ["layer", "broiler"], "description": "Flock type" },
+        "house": { "type": "string", "description": "House or pen" },
+        "placementDate": { "type": "string", "description": "ISO date string" },
+        "initialCount": { "type": "integer", "description": "Number of birds originally placed" },
+        "mortalityCount": { "type": "integer", "description": "Running total of bird deaths" },
+        "currentCount": { "type": "integer", "description": "Current alive birds count" },
+        "status": { "type": "string", "enum": ["active", "closed"], "description": "Status" },
+        "notes": { "type": "string", "description": "Additional notes" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Server timestamp" },
+        "createdBy": { "type": "string", "description": "User UID who created this record" }
+      },
+      "required": ["code", "placementDate", "initialCount", "currentCount", "createdBy"]
+    },
+    "ProductionRecord": {
+      "title": "ProductionRecord",
+      "description": "Daily production log per flock",
+      "type": "object",
+      "properties": {
+        "date": { "type": "string", "description": "ISO date of production" },
+        "flockId": { "type": "string", "description": "Referenced flock ID" },
+        "flockCode": { "type": "string", "description": "Denormalized flock code" },
+        "eggsCollected": { "type": "number", "description": "Number of eggs collected" },
+        "eggsBroken": { "type": "number", "description": "Number of broken eggs" },
+        "mortality": { "type": "number", "description": "Number of bird deaths" },
+        "feedUsedKg": { "type": "number", "description": "Feed used in kg" },
+        "notes": { "type": "string", "description": "Log notes" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Server timestamp" },
+        "createdBy": { "type": "string", "description": "User UID who created this record" }
+      },
+      "required": ["date", "flockId", "createdBy"]
+    },
+    "Sale": {
+      "title": "Sale",
+      "description": "Recorded sales transaction",
+      "type": "object",
+      "properties": {
+        "date": { "type": "string", "description": "ISO date of sale" },
+        "product": { "type": "string", "enum": ["eggs", "live_birds", "manure", "other"] },
+        "description": { "type": "string" },
+        "quantity": { "type": "number" },
+        "unit": { "type": "string" },
+        "unitPrice": { "type": "number" },
+        "total": { "type": "number" },
+        "customer": { "type": "string" },
+        "flockId": { "type": "string" },
+        "flockCode": { "type": "string" },
+        "paymentStatus": { "type": "string", "enum": ["paid", "pending"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "createdBy": { "type": "string" }
+      },
+      "required": ["date", "product", "total", "paymentStatus", "createdBy"]
+    },
+    "Expense": {
+      "title": "Expense",
+      "description": "Recorded farm cost or overhead",
+      "type": "object",
+      "properties": {
+        "date": { "type": "string" },
+        "category": { "type": "string", "enum": ["feed", "medication", "labour", "utilities", "equipment", "transport", "other"] },
+        "description": { "type": "string" },
+        "amount": { "type": "number" },
+        "vendor": { "type": "string" },
+        "flockId": { "type": "string" },
+        "flockCode": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "createdBy": { "type": "string" }
+      },
+      "required": ["date", "category", "amount", "createdBy"]
+    },
+    "InventoryItem": {
+      "title": "InventoryItem",
+      "description": "Store inventory stock item",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "category": { "type": "string", "enum": ["feed", "medication", "equipment", "other"] },
+        "unit": { "type": "string" },
+        "quantity": { "type": "number" },
+        "reorderLevel": { "type": "number" },
+        "unitCost": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "createdBy": { "type": "string" }
+      },
+      "required": ["name", "unit", "quantity", "createdBy"]
+    },
+    "StockMovement": {
+      "title": "StockMovement",
+      "description": "Stock in or out transaction",
+      "type": "object",
+      "properties": {
+        "itemId": { "type": "string" },
+        "itemName": { "type": "string" },
+        "type": { "type": "string", "enum": ["in", "out"] },
+        "quantity": { "type": "number" },
+        "date": { "type": "string" },
+        "note": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "createdBy": { "type": "string" }
+      },
+      "required": ["itemId", "type", "quantity", "date", "createdBy"]
+    },
+    "AppUser": {
+      "title": "AppUser",
+      "description": "Farm member user profile",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "fullName": { "type": "string" },
+        "email": { "type": "string" },
+        "role": { "type": "string", "enum": ["ADMIN", "USER"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "role"]
+    }
+  },
+  "firestore": {
+    "/flocks/{flockId}": {
+      "schema": "Flock",
+      "description": "Batches of poultry birds"
+    },
+    "/productionRecords/{recordId}": {
+      "schema": "ProductionRecord",
+      "description": "Daily egg and mortality logs"
+    },
+    "/sales/{saleId}": {
+      "schema": "Sale",
+      "description": "Sales ledger"
+    },
+    "/expenses/{expenseId}": {
+      "schema": "Expense",
+      "description": "Expenses ledger"
+    },
+    "/inventoryItems/{itemId}": {
+      "schema": "InventoryItem",
+      "description": "Store items and stock levels"
+    },
+    "/stockMovements/{movementId}": {
+      "schema": "StockMovement",
+      "description": "Log of stock in and out movements"
+    },
+    "/users/{userId}": {
+      "schema": "AppUser",
+      "description": "User profiles and farm roles"
+    }
+  }
+}
